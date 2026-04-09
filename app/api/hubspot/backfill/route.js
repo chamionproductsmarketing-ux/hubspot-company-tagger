@@ -1,8 +1,7 @@
 import { tagCompanyFromDeal } from "@/lib/hubspot";
+import { getAccessToken } from "@/lib/token";
 
 export const maxDuration = 60;
-
-const HUBSPOT_BASE = "https://api.hubapi.com";
 
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
@@ -14,19 +13,15 @@ export async function GET(req) {
 
   const after = searchParams.get("after") || undefined;
   const batchSize = 20;
+  const qs = after ? `?limit=${batchSize}&after=${after}` : `?limit=${batchSize}`;
 
-  const qs = after
-    ? `?limit=${batchSize}&after=${after}`
-    : `?limit=${batchSize}`;
-
-  const res = await fetch(`${HUBSPOT_BASE}/crm/v3/objects/deals${qs}`, {
-    headers: { Authorization: `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}` },
+  const token = await getAccessToken();
+  const res = await fetch(`https://api.hubapi.com/crm/v3/objects/deals${qs}`, {
+    headers: { Authorization: `Bearer ${token}` },
   });
   const page = await res.json();
 
-  let tagged = 0;
-  let skipped = 0;
-  let errors = [];
+  let tagged = 0, skipped = 0, errors = [];
 
   for (const deal of page.results || []) {
     try {
@@ -43,12 +38,8 @@ export async function GET(req) {
 
   return Response.json({
     batch: page.results?.length || 0,
-    tagged,
-    skipped,
-    errors,
+    tagged, skipped, errors,
     next: nextAfter ? `${baseUrl}&after=${nextAfter}` : null,
-    message: nextAfter
-      ? "Click 'next' URL to continue processing"
-      : "Backfill complete — no more deals",
+    message: nextAfter ? "Click next URL to continue" : "Backfill complete — no more deals",
   });
 }
