@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/lapsed",
+      "schedule": "0 0 * * *"
+    }
+  ]
+}
