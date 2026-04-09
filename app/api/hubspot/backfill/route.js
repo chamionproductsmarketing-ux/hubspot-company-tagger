@@ -1,7 +1,9 @@
-import { tagCompanyFromDeal } from "@/lib/hubspot";
+import { tagCompanyFromDeal, INVOICE_PIPELINE } from "@/lib/hubspot";
 import { getAccessToken } from "@/lib/token";
 
 export const maxDuration = 60;
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
@@ -11,23 +13,44 @@ export async function GET(req) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const after = searchParams.get("after") || undefined;
+  const after = searchParams.get("after") || "0";
   const totalTagged = parseInt(searchParams.get("tt") || "0");
   const totalSkipped = parseInt(searchParams.get("ts") || "0");
   const totalErrors = parseInt(searchParams.get("te") || "0");
   const batchNum = parseInt(searchParams.get("b") || "1");
 
   const startTime = Date.now();
-  const MAX_MS = 48000; // stop at 48s to leave room
+  const MAX_MS = 45000;
   let cursor = after;
   let tagged = 0, skipped = 0, errors = 0, processed = 0;
 
   while (Date.now() - startTime < MAX_MS) {
-    const qs = cursor ? `?limit=50&after=${cursor}` : "?limit=50";
     const token = await getAccessToken();
-    const res = await fetch(`https://api.hubapi.com/crm/v3/objects/deals${qs}`, {
-      headers: { Authorization: `Bearer ${token}` },
+    const res = await fetch("https://api.hubapi.com/crm/v3/objects/deals/search", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        filterGroups: [{
+          filters: [{
+            propertyName: "pipeline",
+            operator: "EQ",
+            value: INVOICE_PIPELINE,
+          }],
+        }],
+        limit: 100,
+        after: cursor,
+        properties: ["pipeline"],
+      }),
     });
+
+    if (res.status === 429) {
+      await sleep(3000);
+      continue;
+    }
+
     const page = await res.json();
     const deals = page.results || [];
 
@@ -35,13 +58,25 @@ export async function GET(req) {
       if (Date.now() - startTime > MAX_MS) break;
       processed++;
       try {
-        const result = await tagCompanyFromDeal(deal.id);
+        const result = await tagCompanyFromDeal(deal.id, true);
         if (result && !result.skipped) tagged++;
         else skipped++;
       } catch (err) {
-        errors++;
-        console.error(`Backfill error deal ${deal.id}: ${err.message}`);
+        if (err.message.includes("429")) {
+          await sleep(3000);
+          try {
+            const retry = await tagCompanyFromDeal(deal.id, true);
+            if (retry && !retry.skipped) tagged++;
+            else skipped++;
+          } catch (retryErr) {
+            errors++;
+          }
+        } else {
+          errors++;
+          console.error(`Backfill error deal ${deal.id}: ${err.message}`);
+        }
       }
+      await sleep(200);
     }
 
     cursor = page.paging?.next?.after;
@@ -65,12 +100,12 @@ export async function GET(req) {
   const nextUrl = `https://hubspot-company-tagger.vercel.app/api/hubspot/backfill?key=${key}&after=${cursor}&tt=${runTagged}&ts=${runSkipped}&te=${runErrors}&b=${batchNum + 1}`;
 
   return new Response(`<html>
-    <head><meta http-equiv="refresh" content="1;url=${nextUrl}"></head>
+    <head><meta http-equiv="refresh" content="2;url=${nextUrl}"></head>
     <body style="font-family:system-ui;padding:2rem">
       <h1>Backfill in progress...</h1>
       <p><strong>Batch:</strong> ${batchNum} | <strong>This batch:</strong> ${processed} deals</p>
       <p><strong>Running total — Tagged:</strong> ${runTagged} | <strong>Skipped:</strong> ${runSkipped} | <strong>Errors:</strong> ${runErrors}</p>
-      <p>Auto-continuing in 1 second... <a href="${nextUrl}">Click here if not redirected</a></p>
+      <p>Auto-continuing in 2 seconds... <a href="${nextUrl}">Click here if not redirected</a></p>
     </body>
   </html>`, { headers: { "Content-Type": "text/html" } });
 }
