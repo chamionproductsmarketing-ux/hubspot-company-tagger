@@ -13,40 +13,32 @@ export async function GET(req) {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  // Debug mode — just test the search API
   if (searchParams.get("debug") === "1") {
     const token = await getAccessToken();
     const res = await fetch("https://api.hubapi.com/crm/v3/objects/deals/search", {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        filterGroups: [{
-          filters: [{
-            propertyName: "pipeline",
-            operator: "EQ",
-            value: INVOICE_PIPELINE,
-          }],
-        }],
+        filterGroups: [{ filters: [{ propertyName: "pipeline", operator: "EQ", value: INVOICE_PIPELINE }] }],
         limit: 5,
         properties: ["pipeline", "dealname", "dealstage"],
       }),
     });
     const data = await res.json();
-    return Response.json({
-      status: res.status,
-      total: data.total,
-      resultCount: data.results?.length,
-      firstFew: data.results?.slice(0, 3).map(d => ({
-        id: d.id,
-        name: d.properties?.dealname,
-        pipeline: d.properties?.pipeline,
-      })),
-      paging: data.paging,
-      raw: res.ok ? undefined : data,
-    });
+
+    // Also test tagging the first deal to see skip reason
+    const testResults = [];
+    for (const deal of (data.results || []).slice(0, 3)) {
+      try {
+        const result = await tagCompanyFromDeal(deal.id, true);
+        testResults.push({ dealId: deal.id, name: deal.properties?.dealname, ...result });
+      } catch (err) {
+        testResults.push({ dealId: deal.id, name: deal.properties?.dealname, error: err.message });
+      }
+      await sleep(500);
+    }
+
+    return Response.json({ total: data.total, testResults });
   }
 
   const after = searchParams.get("after") || null;
@@ -59,18 +51,12 @@ export async function GET(req) {
   const MAX_MS = 270000;
   let cursor = after;
   let tagged = 0, skipped = 0, errors = 0, processed = 0;
+  const skipReasons = {};
 
   while (Date.now() - startTime < MAX_MS) {
     const token = await getAccessToken();
-
     const searchBody = {
-      filterGroups: [{
-        filters: [{
-          propertyName: "pipeline",
-          operator: "EQ",
-          value: INVOICE_PIPELINE,
-        }],
-      }],
+      filterGroups: [{ filters: [{ propertyName: "pipeline", operator: "EQ", value: INVOICE_PIPELINE }] }],
       limit: 100,
       properties: ["pipeline"],
     };
@@ -78,42 +64,29 @@ export async function GET(req) {
 
     const res = await fetch("https://api.hubapi.com/crm/v3/objects/deals/search", {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify(searchBody),
     });
 
-    if (res.status === 429) {
-      await sleep(5000);
-      continue;
-    }
-
-    if (!res.ok) {
-      const errText = await res.text();
-      console.error(`Search API error: ${res.status} ${errText}`);
-      await sleep(2000);
-      continue;
-    }
+    if (res.status === 429) { await sleep(5000); continue; }
+    if (!res.ok) { await sleep(2000); continue; }
 
     const page = await res.json();
     const deals = page.results || [];
-
-    console.log(`Batch ${batchNum}: got ${deals.length} deals, cursor=${cursor}, total=${page.total}`);
-
-    if (deals.length === 0) {
-      cursor = null;
-      break;
-    }
+    if (deals.length === 0) { cursor = null; break; }
 
     for (const deal of deals) {
       if (Date.now() - startTime > MAX_MS) break;
       processed++;
       try {
         const result = await tagCompanyFromDeal(deal.id, true);
-        if (result && !result.skipped) tagged++;
-        else skipped++;
+        if (result && !result.skipped) {
+          tagged++;
+        } else {
+          skipped++;
+          const reason = result?.reason || "unknown";
+          skipReasons[reason] = (skipReasons[reason] || 0) + 1;
+        }
       } catch (err) {
         if (err.message.includes("429")) {
           await sleep(5000);
@@ -121,9 +94,7 @@ export async function GET(req) {
             const retry = await tagCompanyFromDeal(deal.id, true);
             if (retry && !retry.skipped) tagged++;
             else skipped++;
-          } catch (retryErr) {
-            errors++;
-          }
+          } catch (retryErr) { errors++; }
         } else {
           errors++;
           console.error(`Backfill error deal ${deal.id}: ${err.message}`);
@@ -134,12 +105,12 @@ export async function GET(req) {
 
     cursor = page.paging?.next?.after || null;
     if (!cursor) break;
-    if (Date.now() - startTime > MAX_MS) break;
   }
 
   const runTagged = totalTagged + tagged;
   const runSkipped = totalSkipped + skipped;
   const runErrors = totalErrors + errors;
+  const reasonsHtml = Object.entries(skipReasons).map(([r, c]) => `<li>${r}: ${c}</li>`).join("");
 
   if (!cursor) {
     return new Response(`<html><body style="font-family:system-ui;padding:2rem">
@@ -147,8 +118,7 @@ export async function GET(req) {
       <p><strong>Total tagged:</strong> ${runTagged}</p>
       <p><strong>Total skipped:</strong> ${runSkipped}</p>
       <p><strong>Total errors:</strong> ${runErrors}</p>
-      <p><strong>Batches:</strong> ${batchNum}</p>
-      <p><strong>Deals in last batch:</strong> ${processed}</p>
+      <p><strong>Skip reasons (this batch):</strong></p><ul>${reasonsHtml}</ul>
     </body></html>`, { headers: { "Content-Type": "text/html" } });
   }
 
@@ -160,6 +130,7 @@ export async function GET(req) {
       <h1>Backfill in progress...</h1>
       <p><strong>Batch:</strong> ${batchNum} | <strong>This batch:</strong> ${processed} deals</p>
       <p><strong>Running total — Tagged:</strong> ${runTagged} | <strong>Skipped:</strong> ${runSkipped} | <strong>Errors:</strong> ${runErrors}</p>
+      <p><strong>Skip reasons (this batch):</strong></p><ul>${reasonsHtml}</ul>
       <p>Auto-continuing in 3 seconds... <a href="${nextUrl}">Click here if not redirected</a></p>
     </body>
   </html>`, { headers: { "Content-Type": "text/html" } });
