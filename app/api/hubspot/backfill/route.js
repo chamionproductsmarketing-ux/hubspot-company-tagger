@@ -20,13 +20,12 @@ export async function GET(req) {
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         filterGroups: [{ filters: [{ propertyName: "pipeline", operator: "EQ", value: INVOICE_PIPELINE }] }],
+        sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
         limit: 5,
-        properties: ["pipeline", "dealname", "dealstage"],
+        properties: ["pipeline", "dealname", "createdate"],
       }),
     });
     const data = await res.json();
-
-    // Also test tagging the first deal to see skip reason
     const testResults = [];
     for (const deal of (data.results || []).slice(0, 3)) {
       try {
@@ -37,7 +36,6 @@ export async function GET(req) {
       }
       await sleep(500);
     }
-
     return Response.json({ total: data.total, testResults });
   }
 
@@ -57,6 +55,7 @@ export async function GET(req) {
     const token = await getAccessToken();
     const searchBody = {
       filterGroups: [{ filters: [{ propertyName: "pipeline", operator: "EQ", value: INVOICE_PIPELINE }] }],
+      sorts: [{ propertyName: "createdate", direction: "DESCENDING" }],
       limit: 100,
       properties: ["pipeline"],
     };
@@ -88,19 +87,10 @@ export async function GET(req) {
           skipReasons[reason] = (skipReasons[reason] || 0) + 1;
         }
       } catch (err) {
-        if (err.message.includes("429")) {
-          await sleep(5000);
-          try {
-            const retry = await tagCompanyFromDeal(deal.id, true);
-            if (retry && !retry.skipped) tagged++;
-            else skipped++;
-          } catch (retryErr) { errors++; }
-        } else {
-          errors++;
-          console.error(`Backfill error deal ${deal.id}: ${err.message}`);
-        }
+        errors++;
+        console.error(`Backfill error deal ${deal.id}: ${err.message}`);
       }
-      await sleep(150);
+      await sleep(200);
     }
 
     cursor = page.paging?.next?.after || null;
@@ -118,7 +108,7 @@ export async function GET(req) {
       <p><strong>Total tagged:</strong> ${runTagged}</p>
       <p><strong>Total skipped:</strong> ${runSkipped}</p>
       <p><strong>Total errors:</strong> ${runErrors}</p>
-      <p><strong>Skip reasons (this batch):</strong></p><ul>${reasonsHtml}</ul>
+      <p><strong>Skip reasons (last batch):</strong></p><ul>${reasonsHtml}</ul>
     </body></html>`, { headers: { "Content-Type": "text/html" } });
   }
 
